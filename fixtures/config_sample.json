@@ -1,0 +1,1 @@
+{"retries": 3, "timeout_ms": 5000, "endpoints": {"primary": "https://a.example", "fallback": "https://b.example"}, "featureFlags": {"newParser": false, "batchMode": true}}
