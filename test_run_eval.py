@@ -93,6 +93,29 @@ class RunnerTests(unittest.TestCase):
                                "modelUsage": {"claude-test": {}}, "total_cost_usd": 0.1})
         self.assertEqual(row["status"], "error")
 
+    def test_explicit_result_does_not_fall_back_to_intermediate_text(self):
+        for final in ("", None, [], {}, 0, False):
+            with self.subTest(final=final):
+                events = [{"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "yes"}]}},
+                    {"type": "result", "result": final,
+                     "modelUsage": {"claude-test": {}}, "total_cost_usd": 0.1}]
+                row, _ = self.run_case(stdout="\n".join(map(json.dumps, events)))
+                if final == "":
+                    self.assertEqual(row["status"], "ok")
+                    self.assertEqual(row["score"], 0.0)
+                    self.assertEqual(row["output_chars"], 0)
+                else:
+                    self.assertEqual(row["status"], "error")
+
+    def test_missing_result_text_can_use_streamed_text(self):
+        events = [{"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "yes"}]}},
+            {"type": "result", "modelUsage": {"claude-test": {}}, "total_cost_usd": 0.1}]
+        row, _ = self.run_case(stdout="\n".join(map(json.dumps, events)))
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["score"], 1.0)
+
     def test_invalid_tool_name_is_error_instead_of_scoring(self):
         events = [{"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": None, "input": {}}]}},
@@ -173,6 +196,20 @@ class ScheduleTests(unittest.TestCase):
 
 
 class ScorerTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires named pipes")
+    def test_file_content_assertions_reject_fifos_without_reading(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd = pathlib.Path(td)
+            os.mkfifo(cwd / "pipe")
+            for kind in ("file_matches", "file_not_matches"):
+                with self.subTest(kind=kind), \
+                        mock.patch.object(pathlib.Path, "read_text", return_value="fixture") as read:
+                    passed, failed = run_eval.score({"assertions": [
+                        {"type": kind, "path": "pipe", "re": "fixture"}]}, "", [], {}, cwd)
+                    self.assertEqual(passed, [])
+                    self.assertEqual(len(failed), 1)
+                    read.assert_not_called()
+
     def test_zero_turns_are_valid(self):
         passed, failed = run_eval.score({"assertions": [{"type": "max_turns", "n": 1}]},
                                         "", [], {"num_turns": 0}, pathlib.Path("."))
@@ -223,6 +260,51 @@ class ScorerTests(unittest.TestCase):
             env = child.call_args.kwargs["env"]
             self.assertNotIn("CC_EVAL_TEST_TOKEN", env)
             self.assertNotEqual(env["HOME"], os.environ.get("HOME"))
+
+
+class SettingsTests(unittest.TestCase):
+    def test_settings_replace_symlink_without_overwriting_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            source = root / "settings-fixture.json"
+            source.write_text(json.dumps({"hooks": {"Stop": [{}]}, "env": {"TEST": "value"},
+                                          "model": "opus", "statusLine": {}}))
+            victim = root / "untouched.txt"
+            victim.write_text("keep")
+            victim.chmod(0o644)
+            output = root / "eval-settings.json"
+            output.symlink_to(victim)
+            replace = os.replace
+
+            def check_private_before_publish(src, dst):
+                self.assertEqual(pathlib.Path(src).stat().st_mode & 0o777, 0o600)
+                replace(src, dst)
+
+            with mock.patch.object(run_eval, "REAL_SETTINGS", source), \
+                    mock.patch.object(run_eval, "EVAL_SETTINGS", output), \
+                    mock.patch.object(run_eval.os, "replace", side_effect=check_private_before_publish):
+                self.assertEqual(run_eval.build_eval_settings(), output)
+            self.assertFalse(output.is_symlink())
+            self.assertEqual(victim.read_text(), "keep")
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(output.read_text()), {"hooks": {"Stop": []}, "model": "opus"})
+
+    def test_failed_settings_publish_preserves_old_file_and_removes_temp(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            source = root / "settings-fixture.json"
+            source.write_text("{}")
+            output = root / "eval-settings.json"
+            output.write_text("previous")
+            before = set(root.iterdir())
+            with mock.patch.object(run_eval, "REAL_SETTINGS", source), \
+                    mock.patch.object(run_eval, "EVAL_SETTINGS", output), \
+                    mock.patch.object(run_eval.os, "replace", side_effect=OSError("fixture")):
+                with self.assertRaises(OSError):
+                    run_eval.build_eval_settings()
+            self.assertEqual(output.read_text(), "previous")
+            self.assertEqual(set(root.iterdir()), before)
 
 
 if __name__ == "__main__":

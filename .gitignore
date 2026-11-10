@@ -36,3 +36,4 @@ Thumbs.db
 sandbox/
 results/
 .eval-settings.json
+.eval-settings-*.json
