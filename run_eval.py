@@ -70,13 +70,24 @@ def build_eval_settings() -> pathlib.Path:
     # 显式把每个 hook event 写成空数组：--settings 是**逐键深合并**不是整块覆盖
     # （~/.claude/bin/claude:113 有实测记录），单写 hooks={} 不足以证明覆盖。
     # 真正的隔离靠下面 CLI 的 --setting-sources 排除 user 源，这里是第二道保险。
-    d["hooks"] = {ev: [] for ev in json.loads(REAL_SETTINGS.read_text(encoding="utf-8"))
-                  .get("hooks", {})}
+    d["hooks"] = {ev: [] for ev in d.get("hooks", {})}
     d.pop("statusLine", None)
     d.pop("omcHud", None)
     d.pop("env", None)          # 不把可能含凭据的 env 复制进临时文件
-    EVAL_SETTINGS.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-    EVAL_SETTINGS.chmod(0o600)
+    # Create privately before writing, then replace atomically without following a
+    # pre-existing destination symlink or truncating the last usable settings.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=EVAL_SETTINGS.parent,
+                                         prefix=".eval-settings-", suffix=".json",
+                                         delete=False) as stream:
+            temporary = pathlib.Path(stream.name)
+            json.dump(d, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, EVAL_SETTINGS)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return EVAL_SETTINGS
 
 
@@ -219,7 +230,7 @@ def run_case(case: dict, model: str, effort: str, settings: pathlib.Path,
     u = result.get("usage") or {}
     if not isinstance(u, dict):
         u = {}
-    final = result.get("result") or "\n".join(text_out)
+    final = result.get("result", "\n".join(text_out))
     if not isinstance(final, str):
         return {**base, "status": "error", "score": None, "reason": "invalid result text"}
     passed, failed = score(case, final, tools, result, cwd)
@@ -288,8 +299,10 @@ def score(case: dict, out: str, tools: list[tuple[str, str]],
         elif t in ("file_matches", "file_not_matches"):
             try:
                 p = local_file(cwd, a["path"])
-                match = re.search(a["re"], p.read_text(encoding="utf-8"))
-                ok = (match is not None) if t == "file_matches" else (match is None)
+                ok = False
+                if p.is_file():
+                    match = re.search(a["re"], p.read_text(encoding="utf-8"))
+                    ok = (match is not None) if t == "file_matches" else (match is None)
             except (ValueError, OSError, RuntimeError):
                 ok = False
         elif t == "max_turns":
